@@ -39,6 +39,7 @@ This script closes that gap:
 | `curl` | any | GitLab / GitHub API calls |
 | `jq` | >= 1.6 | Process JSON from kubectl |
 | `python3` | any | URL-encode GitLab repo paths |
+| `bash` | **>= 4.3** | Associative arrays and namerefs (macOS ships 3.2 — `brew install bash`) |
 
 To verify you have the right `yq`:
 ```bash
@@ -274,6 +275,7 @@ name mapping before merging.
 | Problem | Likely cause | Fix |
 |---|---|---|
 | `yq v4 required` error | Wrong `yq` installed (e.g., `python-yq`) | Install `mikefarah/yq` v4 |
+| `Bash >= 4.3 is required` error | macOS ships Bash 3.2 | `brew install bash`, then run with `/usr/local/bin/bash migrate-gitops-nudges.sh` |
 | `ArgoCD Application not found` | Wrong `--argocd-namespace` | Pass the correct namespace with `--argocd-namespace` |
 | `Could not resolve GitLab project ID` | Token missing `api` scope or wrong host | Check token scopes and repo URL |
 | Component skipped: "not ArgoCD-managed" | Component has no `app.kubernetes.io/instance` label | Run `nudge-migrate.sh` for this component |

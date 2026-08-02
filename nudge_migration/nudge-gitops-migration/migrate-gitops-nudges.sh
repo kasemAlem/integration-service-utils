@@ -107,6 +107,12 @@ check_deps() {
         error "yq v4 (mikefarah/yq) is required. Found: $(yq --version 2>&1 | head -1)"
         exit 1
     fi
+    # Require Bash >= 4.3 (associative arrays need 4.0+; local -n namerefs need 4.3+)
+    if [[ "${BASH_VERSINFO[0]}" -lt 4 ]] || \
+       { [[ "${BASH_VERSINFO[0]}" -eq 4 ]] && [[ "${BASH_VERSINFO[1]}" -lt 3 ]]; }; then
+        error "Bash >= 4.3 is required (found ${BASH_VERSION}). On macOS: brew install bash"
+        exit 1
+    fi
 }
 
 # ---------------------------------------------------------------------------
@@ -231,10 +237,11 @@ remove_build_nudges_ref() {
             if grep -q '\$(' "$file"; then
                 warning "File '$file' contains kustomize variable substitutions — field will still be removed; please verify component name mapping in the MR"
             fi
-            # Remove build-nudges-ref from any Component document using yq.
-            # The `| .` ensures non-Component documents pass through unchanged in
-            # multi-document YAML files.
-            yq eval 'select(.kind == "Component").spec |= del(."build-nudges-ref") | .' \
+            # Remove build-nudges-ref from Component documents only.
+            # if/then/else guarantees every document (Namespace, Application, etc.)
+            # is always emitted — select()-based expressions can silently drop
+            # non-matching documents from multi-document YAML files.
+            yq eval 'if .kind == "Component" then .spec |= del(."build-nudges-ref") else . end' \
                 -i "$file"
             changed_files+=("$file")
         fi
@@ -310,19 +317,24 @@ create_gitlab_mr() {
     local encoded_path
     encoded_path=$(python3 -c "import urllib.parse, sys; print(urllib.parse.quote(sys.argv[1], safe=''))" "$repo_path")
 
-    local project_id
-    project_id=$(curl -s \
+    local api_resp project_id
+    api_resp=$(curl -sS --fail-with-body \
         -H "PRIVATE-TOKEN: ${GITLAB_TOKEN}" \
-        "https://${gitlab_host}/api/v4/projects/${encoded_path}" \
-        | jq -r '.id')
-
+        "https://${gitlab_host}/api/v4/projects/${encoded_path}" 2>&1) || {
+        error "GitLab API request failed for '${repo_path}': ${api_resp}"
+        return 1
+    }
+    project_id=$(echo "$api_resp" | jq -r '.id' 2>/dev/null) || {
+        error "Could not parse GitLab project ID response for '${repo_path}'"
+        return 1
+    }
     if [[ -z "$project_id" || "$project_id" == "null" ]]; then
         error "Could not resolve GitLab project ID for '${repo_path}' on '${gitlab_host}'"
         return 1
     fi
 
-    local mr_url
-    mr_url=$(curl -s -X POST \
+    local mr_resp mr_url
+    mr_resp=$(curl -sS --fail-with-body -X POST \
         "https://${gitlab_host}/api/v4/projects/${project_id}/merge_requests" \
         -H "PRIVATE-TOKEN: ${GITLAB_TOKEN}" \
         -H "Content-Type: application/json" \
@@ -332,9 +344,14 @@ create_gitlab_mr() {
             --arg title "$title" \
             --arg body "$body" \
             '{source_branch:$sb, target_branch:$tb, title:$title, description:$body, remove_source_branch:true}'
-        )" \
-        | jq -r '.web_url')
-
+        )" 2>&1) || {
+        error "GitLab MR creation failed: ${mr_resp}"
+        return 1
+    }
+    mr_url=$(echo "$mr_resp" | jq -r '.web_url' 2>/dev/null) || {
+        error "Could not parse GitLab MR URL from response"
+        return 1
+    }
     echo "$mr_url"
 }
 
@@ -349,8 +366,8 @@ create_github_pr() {
     local title="$5"
     local body="$6"
 
-    local pr_url
-    pr_url=$(curl -s -X POST \
+    local pr_resp pr_url
+    pr_resp=$(curl -sS --fail-with-body -X POST \
         "https://api.github.com/repos/${owner}/${repo}/pulls" \
         -H "Authorization: Bearer ${GITHUB_TOKEN}" \
         -H "Accept: application/vnd.github+json" \
@@ -360,9 +377,14 @@ create_github_pr() {
             --arg base "$target_branch" \
             --arg body "$body" \
             '{title:$title, head:$head, base:$base, body:$body}'
-        )" \
-        | jq -r '.html_url')
-
+        )" 2>&1) || {
+        error "GitHub PR creation failed: ${pr_resp}"
+        return 1
+    }
+    pr_url=$(echo "$pr_resp" | jq -r '.html_url' 2>/dev/null) || {
+        error "Could not parse GitHub PR URL from response"
+        return 1
+    }
     echo "$pr_url"
 }
 
@@ -404,7 +426,13 @@ process_application() {
     local repo_url source_path branch
     repo_url=$(echo "$app_json" | jq -r '.spec.source.repoURL')
     source_path=$(echo "$app_json" | jq -r '.spec.source.path // "."')
-    branch=$(echo "$app_json" | jq -r '.spec.source.targetRevision // "main"')
+    branch=$(echo "$app_json" | jq -r '.spec.source.targetRevision // ""')
+    # HEAD and empty targetRevision both mean "default branch" in ArgoCD.
+    # git clone --branch HEAD fails; clone without --branch and resolve afterwards.
+    local use_default_branch=false
+    if [[ -z "$branch" || "$branch" == "HEAD" ]]; then
+        use_default_branch=true
+    fi
 
     local platform
     platform=$(detect_platform "$repo_url")
@@ -487,8 +515,14 @@ process_application() {
 
     # ---- Clone ----
     local clone_dir="${WORKDIR}/${app_name}"
-    local auth_url
 
+    # Write credentials to a per-clone .netrc so tokens never appear in the
+    # clone URL (which would expose them in `ps aux` and .git/config).
+    local netrc_file="${WORKDIR}/.netrc-${app_name//[^a-zA-Z0-9]/_}"
+    chmod 600 /dev/null  # ensure umask won't widen permissions
+    : > "$netrc_file" && chmod 600 "$netrc_file"
+
+    local clone_url
     if [[ "$platform" == "gitlab" ]]; then
         if [[ -z "$GITLAB_TOKEN" ]]; then
             error "GITLAB_TOKEN is required for GitLab repos. Set --gitlab-token or export GITLAB_TOKEN."
@@ -498,7 +532,8 @@ process_application() {
         gitlab_host=$(echo "$repo_url" | sed -E 's|https?://([^/]+)/.*|\1|')
         local repo_path
         repo_path=$(echo "$repo_url" | sed -E "s|https?://${gitlab_host}/||" | sed 's|\.git$||')
-        auth_url="https://oauth2:${GITLAB_TOKEN}@${gitlab_host}/${repo_path}.git"
+        printf 'machine %s login oauth2 password %s\n' "$gitlab_host" "$GITLAB_TOKEN" > "$netrc_file"
+        clone_url="https://${gitlab_host}/${repo_path}.git"
     else
         if [[ -z "$GITHUB_TOKEN" ]]; then
             error "GITHUB_TOKEN is required for GitHub repos. Set --github-token or export GITHUB_TOKEN."
@@ -506,11 +541,22 @@ process_application() {
         fi
         local gh_path
         gh_path=$(echo "$repo_url" | sed -E 's|https?://github.com/||' | sed 's|\.git$||')
-        auth_url="https://x-access-token:${GITHUB_TOKEN}@github.com/${gh_path}.git"
+        printf 'machine github.com login x-access-token password %s\n' "$GITHUB_TOKEN" > "$netrc_file"
+        clone_url="https://github.com/${gh_path}.git"
     fi
 
     info "Cloning ${repo_url} ..."
-    git clone --quiet --branch "$branch" --depth 1 "$auth_url" "$clone_dir"
+    if [[ "$use_default_branch" == "true" ]]; then
+        GIT_CONFIG_NOSYSTEM=1 HOME="$WORKDIR" NETRC="$netrc_file" \
+            git clone --quiet --depth 1 "$clone_url" "$clone_dir"
+        # Resolve the actual default branch name for the MR/PR base target
+        branch=$(git -C "$clone_dir" symbolic-ref --quiet refs/remotes/origin/HEAD \
+            | sed 's@^refs/remotes/origin/@@' || echo "main")
+        info "  Resolved default branch: ${branch}"
+    else
+        GIT_CONFIG_NOSYSTEM=1 HOME="$WORKDIR" NETRC="$netrc_file" \
+            git clone --quiet --branch "$branch" --depth 1 "$clone_url" "$clone_dir"
+    fi
 
     local full_source_path="${clone_dir}/${source_path}"
 
@@ -565,13 +611,15 @@ process_application() {
         cd "$clone_dir"
         git config user.email "migration-script@konflux"
         git config user.name "ADR-0067 Migration"
+        git remote set-url origin "$clone_url"
         git checkout -b "$new_branch"
         git add -A
         git commit -m "migration: remove build-nudges-ref, add NudgeConfig (ADR-0067)
 
 Automated migration per ADR-0067 NudgeConfig migration.
 Removes build-nudges-ref from Component specs and adds NudgeConfig singleton."
-        git push origin "$new_branch"
+        GIT_CONFIG_NOSYSTEM=1 HOME="$WORKDIR" NETRC="$netrc_file" \
+            git push origin "$new_branch"
     )
 
     # ---- Step 5f: Create MR/PR ----
@@ -639,7 +687,7 @@ main() {
         local count=0 argo_count=0
         while IFS= read -r comp_json; do
             [[ -z "$comp_json" ]] && continue
-            ((count++))
+            count=$((count + 1))
 
             local comp_name
             comp_name=$(echo "$comp_json" | jq -r '.metadata.name')
@@ -652,7 +700,7 @@ main() {
                 continue
             fi
 
-            ((argo_count++))
+            argo_count=$((argo_count + 1))
             info "  ${comp_name}: ArgoCD app=${app_name}"
 
             # Accumulate into APPS_DATA_FILE: {appName: [{ns, comp_json}]}
