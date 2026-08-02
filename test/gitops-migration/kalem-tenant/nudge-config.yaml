@@ -1,0 +1,14 @@
+apiVersion: appstudio.redhat.com/v1beta2
+kind: NudgeConfig
+metadata:
+  name: nudge-config
+  namespace: kalem-tenant
+  labels:
+    nudging.konflux-ci.dev/owner: build-service
+  annotations:
+    nudging.konflux-ci.dev/migrated-from: build-nudges-ref
+spec:
+  nudges:
+    - from: devfile-sample-python-basic-b323c
+      to: my-office-manager-f5699
+      mode: immediate
