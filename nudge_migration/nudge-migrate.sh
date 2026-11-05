@@ -757,6 +757,20 @@ latest_backup_for() {
 }
 
 # ---------------------------------------------------------------------------
+# Rollback: read the run timestamp encoded in a backup file name
+# (${ns}-nudge-config-YYYYMMDDTHHMMSSZ.json) as RFC3339.
+# Returns 1 when the name does not carry a parsable timestamp.
+# ---------------------------------------------------------------------------
+backup_timestamp() {
+  local file=$1 base stamp
+  base=$(basename "$file")
+  stamp=$(sed -nE 's/.*-nudge-config-([0-9]{8}T[0-9]{6}Z)\.json$/\1/p' <<<"$base")
+  [[ -n "$stamp" ]] || return 1
+  date -u -d "${stamp:0:4}-${stamp:4:2}-${stamp:6:2}T${stamp:9:2}:${stamp:11:2}:${stamp:13:2}Z" \
+    +%Y-%m-%dT%H:%M:%SZ 2>/dev/null
+}
+
+# ---------------------------------------------------------------------------
 # Rollback a single namespace
 # ---------------------------------------------------------------------------
 rollback_namespace() {
@@ -846,19 +860,43 @@ rollback_namespace() {
           WINDOW_START=""
         fi
       fi
-      [[ -n "$WINDOW_START" ]] && log_info "Requeue window derived from backup $backup_file"
+      if [[ -n "$WINDOW_START" ]]; then
+        # End the window at the original rollback, not at "now": builds created
+        # after the NudgeConfig was deleted were never skipped, so they were
+        # nudged normally and re-marked by build-service. Requeueing them on a
+        # rerun would nudge them a second time.
+        local rollback_ts
+        if rollback_ts=$(backup_timestamp "$backup_file"); then
+          if [[ "$rollback_ts" < "$WINDOW_END" ]]; then
+            WINDOW_END=$rollback_ts
+            log_info "Requeue window ends at the original rollback time ($WINDOW_END)," \
+                     "so builds nudged afterwards are not requeued again"
+          fi
+        else
+          log_warn "$namespace: cannot read the rollback time from $backup_file —" \
+                   "using now as the window end; pass --since to narrow it"
+        fi
+        log_info "Requeue window derived from backup $backup_file"
+      fi
     fi
   fi
 
   if [[ -z "$WINDOW_START" ]]; then
-    log_error "$namespace: cannot derive the requeue window (no NudgeConfig, no backup, no --since)"
+    if $nc_exists; then
+      log_error "$namespace: cannot derive the requeue window — the NudgeConfig has no" \
+                "migrated-at annotation and migrated-action is '${migrated_action:-<none>}'" \
+                "(legacy or merged config); pass --since"
+    else
+      log_error "$namespace: cannot derive the requeue window (no NudgeConfig, no backup, no --since)"
+    fi
     SUMMARIES+=("$namespace|error|0|0|Cannot derive window; pass --since")
     return
   fi
 
   if [[ "$WINDOW_START" > "$WINDOW_END" ]]; then
-    log_error "$namespace: requeue window start $WINDOW_START is after now $WINDOW_END — pass --since"
-    SUMMARIES+=("$namespace|error|0|0|Window start is in the future")
+    log_error "$namespace: requeue window start $WINDOW_START is after the window end" \
+              "$WINDOW_END — pass --since"
+    SUMMARIES+=("$namespace|error|0|0|Window start is after the window end")
     return
   fi
 

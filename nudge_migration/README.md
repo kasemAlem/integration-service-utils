@@ -209,7 +209,11 @@ integration-service's own idempotency guard.
   without `migrated-at`, `--since` is required: their `creationTimestamp` is
   the user's original config age, not the migration start.
 - If the NudgeConfig is already gone (rerun), the window comes from `--since` or
-  the latest backup in `--backup-dir`; with neither, the run fails.
+  the latest backup in `--backup-dir`; with neither, the run fails. A
+  backup-derived window **ends at the original rollback time** (read from the
+  backup file name), not at "now": builds created after the NudgeConfig was
+  deleted were never skipped, so build-service nudged them normally and set the
+  annotation itself — requeueing them on a rerun would nudge them twice.
 - Before deleting, the config is re-read and its `resourceVersion` compared; a
   change mid-run aborts with nothing written.
 - A backup (`<ns>-nudge-config-<ts>.json`) and a PipelineRun audit list
@@ -232,8 +236,10 @@ A build PipelineRun is selected when it:
   `pipelines.appstudio.openshift.io/type=build`,
 - was triggered by a `push` or `incoming` event (read from the label or the
   annotation, case-insensitive), and
-- either was created in `[window start, now]` or was still running when the
-  window started (`status.completionTime` absent or not before the start).
+- either was created in `[window start, window end]` or was still running when
+  the window started (`status.completionTime` absent or not before the start).
+  The window end is "now", or the original rollback time when the window is
+  derived from a backup.
 
 The window is required because build-service also sets the annotation *after a
 successful nudge*. Without it, an old already-nudged build would be nudged

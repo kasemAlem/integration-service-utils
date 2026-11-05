@@ -55,6 +55,8 @@ use_config() {
 
 use_components() { cp "$FIXTURES/$1" "$FIXTURE_DIR/components.json"; }
 
+use_pipelineruns() { cp "$FIXTURES/$1" "$FIXTURE_DIR/pipelineruns.json"; }
+
 run_script() {
   OUTPUT=$(env \
     PATH="$MOCK_DIR:$PATH" \
@@ -247,6 +249,8 @@ run_script --rollback --force --backup-dir "$BACKUP_DIR" tenant-a
 assert_rc 1
 assert_no_writes
 assert_output "asks for --since" "cannot derive the requeue window"
+assert_output "names the legacy config rather than a missing one" "legacy or merged config"
+refute_output "does not claim the NudgeConfig is absent" "no NudgeConfig, no backup"
 
 begin_case "forced legacy rollback with --since"
 use_config legacy
@@ -269,13 +273,26 @@ assert_output "reports the config as absent" "NudgeConfig already absent."
 
 begin_case "rerun derives the window from the backup"
 use_config none
-cp "$FIXTURES/nudgeconfig-created.json" "$BACKUP_DIR/tenant-a-nudge-config-20261101T000000Z.json"
+# The first rollback ran after the in-window builds were created (Nov 2-3).
+cp "$FIXTURES/nudgeconfig-created.json" "$BACKUP_DIR/tenant-a-nudge-config-20261104T000000Z.json"
 EXTRA_ENV=(MOCK_NC_NOT_FOUND=true)
 run_script --rollback --backup-dir "$BACKUP_DIR" tenant-a
 assert_rc 0
 assert_call_count "no delete when config is absent" 0 delete
 assert_call_count "requeues four builds" 4 annotate
 assert_output "reads the backup" "Requeue window derived from backup"
+assert_output "ends the window at the original rollback time" "Requeue window ends at the original rollback time (2026-11-04T00:00:00Z)"
+
+begin_case "rerun from a backup leaves builds nudged after the rollback alone"
+use_config none
+use_pipelineruns pipelineruns-post-rollback.json
+cp "$FIXTURES/nudgeconfig-created.json" "$BACKUP_DIR/tenant-a-nudge-config-20261104T000000Z.json"
+EXTRA_ENV=(MOCK_NC_NOT_FOUND=true)
+run_script --rollback --backup-dir "$BACKUP_DIR" tenant-a
+assert_rc 0
+assert_call_count "requeues only the builds from the migration window" 4 annotate
+assert_not_annotated "plr-post-rollback"
+assert_output "footer does not count the post-rollback build" "Build PipelineRuns requeued: 4"
 
 begin_case "rerun without a window is refused"
 use_config none
